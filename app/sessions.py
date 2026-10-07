@@ -90,6 +90,29 @@ or history.  If another process commits first, a stale seal gets the
 409; if the seal lands first, the other process's write gets the 409.
 Records written before archiving existed read the flag as false.
 
+Review comments (``register_comments`` / ``resolve_comment``,
+``POST /sessions/{id}/comments`` and
+``POST /sessions/{id}/comments/{cid}/resolve``) let reviewers anchor a
+remark on a JSON Pointer location of an un-archived session.  Each
+registration snapshots the value its pointer resolves to at the current
+revision (an explicit ``null`` is kept; a missing location is rejected);
+registering or processing a comment bumps no revision, appends no log
+entry and writes no history boundary -- only the comment list is
+persisted in the same cross-process locked section.  A batch or
+JSONPath-replacement *commit* that changes a pending comment's
+pointed-to value (resolved against the committed document, so ancestor
+subtree replacements and array index shifts count, and missing/explicit
+``null`` and boolean/number stay distinguishable) still commits
+normally, but durably marks the comment stale in the same atomic write.
+The stale flag is sticky: a later commit restoring the original value
+never clears it.  Comments are processed with an expected revision
+(409 on a race); processing a stale comment requires ``confirm_stale``
+(otherwise 409), processing an already-resolved comment is idempotent,
+and resolved comments never reopen.  Archiving is refused (409) while
+any comment is pending or stale, and after a seal comment registrations
+and resolutions are refused (409) as well; records written before
+comments existed read the empty list.
+
 Sessions are persisted as one JSON file per session inside a directory
 (``SESSION_STORE_DIR`` env var, default ``.sessions``), so they remain
 readable after the service (or ``docker compose``) restarts.  The lock
@@ -164,6 +187,27 @@ class ProtectedPathValidationError(ValueError):
 
 class ProtectedPathError(ValueError):
     """Raised when a commit would change one of a session's protected paths."""
+
+
+class ReviewCommentValidationError(ValueError):
+    """Raised when a review comment registration is malformed.
+
+    A review pointer must be a strict RFC 6901 JSON Pointer and must
+    address a node that exists in the session's current merged document
+    (an explicit JSON ``null`` is a node; a missing location is not).
+    """
+
+
+class ReviewCommentNotFoundError(KeyError):
+    """Raised when a review comment id does not exist in the session."""
+
+
+class OpenReviewCommentsError(RevisionConflictError):
+    """Raised when archiving is blocked by pending or stale review comments.
+
+    Subclasses :class:`RevisionConflictError` so it surfaces as ``409`` at
+    the HTTP layer, like a stale expected revision.
+    """
 
 
 _MISSING = object()
@@ -341,6 +385,129 @@ class _Boundary:
 
 
 @dataclass
+class _ReviewComment:
+    """A review comment registered on a JSON Pointer location.
+
+    ``value`` is the value the pointer resolved to at registration time
+    (durable snapshot; an explicit JSON ``null`` is kept, a missing
+    location cannot be registered).  ``stale`` is a durable flag: it is
+    set once, inside the commit that first changes the location's
+    resolved value relative to the snapshotted value, and it never clears
+    again -- a later edit that restores the original value leaves the
+    comment stale.  ``resolved`` records explicit processing; a comment
+    is reported as ``pending``, ``stale`` or ``resolved``.
+    """
+
+    comment_id: str
+    path: str
+    comment: str
+    revision: int
+    value: Any
+    stale: bool = False
+    stale_revision: int | None = None
+    resolved: bool = False
+    resolved_revision: int | None = None
+
+    @property
+    def status(self) -> str:
+        if self.resolved:
+            return "resolved"
+        return "stale" if self.stale else "pending"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "comment_id": self.comment_id,
+            "path": self.path,
+            "comment": self.comment,
+            "revision": self.revision,
+            "value": deepcopy(self.value),
+            "stale": self.stale,
+            **(
+                {"stale_revision": self.stale_revision}
+                if self.stale_revision is not None
+                else {}
+            ),
+            "resolved": self.resolved,
+            **(
+                {"resolved_revision": self.resolved_revision}
+                if self.resolved_revision is not None
+                else {}
+            ),
+        }
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "_ReviewComment":
+        return cls(
+            comment_id=data["comment_id"],
+            path=data["path"],
+            comment=data["comment"],
+            revision=int(data["revision"]),
+            value=deepcopy(data["value"]),
+            stale=bool(data.get("stale", False)),
+            stale_revision=(
+                int(data["stale_revision"])
+                if data.get("stale_revision") is not None
+                else None
+            ),
+            resolved=bool(data.get("resolved", False)),
+            resolved_revision=(
+                int(data["resolved_revision"])
+                if data.get("resolved_revision") is not None
+                else None
+            ),
+        )
+
+    def to_state(self) -> dict[str, Any]:
+        """Serialize the comment for the public session/comment responses."""
+        return {
+            "comment_id": self.comment_id,
+            "path": self.path,
+            "comment": self.comment,
+            "revision": self.revision,
+            "value": deepcopy(self.value),
+            "status": self.status,
+            "stale_revision": self.stale_revision,
+            "resolved_revision": self.resolved_revision,
+        }
+
+
+def _snapshot_value_matches(snapshot: Any, resolved: Any) -> bool:
+    """Compare a registered snapshot against a freshly resolved value.
+
+    A missing location is the ``_MISSING`` sentinel and therefore always
+    differs from any present value (an explicit ``null`` included);
+    present values use the same JSON structural equality as the
+    protected-pointer guard, so booleans never equal numbers while
+    ``1`` equals ``1.0``.
+    """
+    if resolved is _MISSING:
+        return False
+    return _json_equal(snapshot, resolved)
+
+
+def _mark_stale_comments(
+    comments: list[_ReviewComment], document: Any, stale_revision: int
+) -> None:
+    """Durably mark pending comments whose location no longer matches.
+
+    Only still-pending comments are considered: a comment already marked
+    stale never recovers (the flag is durable), and resolved comments are
+    final.  The comparison resolves the registered pointer against the
+    committed document, so ancestor subtree replacements and array
+    inserts/deletes shifting a registered index surface as changes just
+    like a direct write, and missing/explicit-``null`` and
+    boolean/number distinctions are preserved.
+    """
+    for note in comments:
+        if note.stale or note.resolved:
+            continue
+        current = _pointer_value(document, note.path)
+        if not _snapshot_value_matches(note.value, current):
+            note.stale = True
+            note.stale_revision = stale_revision
+
+
+@dataclass
 class SessionRecord:
     """The durable state of one session.
 
@@ -361,6 +528,14 @@ class SessionRecord:
     later read.  Archiving adds neither a log entry nor a revision; once
     set, the record never changes again.  Records written before archiving
     existed read ``archived`` as false and carry no snapshot.
+
+    ``comments`` are review comments registered on JSON Pointer locations
+    (with the value snapshotted at registration).  Registering or
+    processing a comment bumps no revision and appends no history; a
+    content commit durably marks affected pending comments stale.  A
+    session cannot be archived while any comment is still pending or
+    stale, and after a seal the comments can no longer change.  Records
+    written before comments existed read an empty list.
     """
 
     session_id: str
@@ -372,6 +547,7 @@ class SessionRecord:
     protected_paths: list[str] = field(default_factory=list)
     archived: bool = False
     archive_state: dict[str, Any] | None = None
+    comments: list[_ReviewComment] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -400,6 +576,11 @@ class SessionRecord:
                 if self.archive_state is not None
                 else {}
             ),
+            # Review comments are written explicitly (even when empty) so
+            # every process sharing the directory and every restart agrees
+            # on the rule; records written before the feature omit it and
+            # read back the empty list.
+            "comments": [note.to_json() for note in self.comments],
         }
 
     @classmethod
@@ -417,6 +598,13 @@ class SessionRecord:
         # Records written before archiving existed are open by default.
         archived = bool(data.get("archived", False))
         archive_state = data.get("archive", None) if archived else None
+        # Sessions written before review comments existed have none.
+        raw_comments = data.get("comments", [])
+        comments = (
+            [_ReviewComment.from_json(item) for item in raw_comments]
+            if raw_comments
+            else []
+        )
         return cls(
             session_id=data["session_id"],
             revision=int(data["revision"]),
@@ -427,6 +615,7 @@ class SessionRecord:
             protected_paths=protected_paths,
             archived=archived,
             archive_state=archive_state,
+            comments=comments,
         )
 
 
@@ -613,6 +802,7 @@ class SessionStore:
                 "tombstones": list(rec.archive_state["tombstones"]),
                 "archived": True,
                 "protected_paths": list(rec.protected_paths),
+                "comments": [note.to_state() for note in rec.comments],
             }
         # Reads stay lock-free (the atomic temp-file-plus-rename persist
         # guarantees a coherent file); only a legacy record's first touch
@@ -629,6 +819,7 @@ class SessionStore:
             "tombstones": result["tombstones"],
             "archived": rec.archived,
             "protected_paths": list(rec.protected_paths),
+            "comments": [note.to_state() for note in rec.comments],
         }
 
     def _migrate_legacy(self, session_id: str) -> SessionRecord:
@@ -728,6 +919,10 @@ class SessionStore:
                 _check_protected_paths(
                     rec.protected_paths, current_document, new_document
                 )
+            # The commit proceeds: durably mark pending review comments
+            # whose pointed-to value changes in the would-be document.
+            # The flag is part of this same atomic write and is sticky.
+            _mark_stale_comments(rec.comments, new_document, rec.revision + 1)
             rec.log = unique_ops
             rec.revision += 1
             # Immutable boundary: later batches never rewrite this entry,
@@ -852,6 +1047,10 @@ class SessionStore:
                 _check_protected_paths(
                     rec.protected_paths, current_document, new_document
                 )
+            # Same durable, sticky stale-marking as submit_batch: any
+            # pending comment whose matched location changes in the
+            # would-be document is marked in this same atomic write.
+            _mark_stale_comments(rec.comments, new_document, rec.revision + 1)
             rec.log = unique_ops
             rec.revision += 1
             rec.history.append(_Boundary(rec.revision, new_document))
@@ -900,6 +1099,35 @@ class SessionStore:
                     f"expected revision {expected_revision} but session "
                     f"{session_id!r} is at revision {rec.revision}"
                 )
+            # Every review comment must be processed (resolved) before the
+            # session can be finalized: pending or stale comments block the
+            # seal with 409 and change nothing.  A successfully archived
+            # session therefore always carries only resolved comments, so
+            # the idempotent re-seal below reaches this guard vacuously.
+            open_comments = [
+                note for note in rec.comments if not note.resolved
+            ]
+            if open_comments:
+                pending = [
+                    f"{note.comment_id} ({note.path})"
+                    for note in open_comments
+                    if not note.stale
+                ]
+                stale = [
+                    f"{note.comment_id} ({note.path})"
+                    for note in open_comments
+                    if note.stale
+                ]
+                details = []
+                if pending:
+                    details.append(f"pending: {', '.join(pending)}")
+                if stale:
+                    details.append(f"stale: {', '.join(stale)}")
+                raise OpenReviewCommentsError(
+                    f"session {session_id!r} cannot be archived while it has "
+                    f"review comments that are not resolved -- "
+                    + "; ".join(details)
+                )
             if rec.archived:
                 if rec.archive_state is None:
                     # Defensive: a record carrying the flag without its
@@ -924,6 +1152,145 @@ class SessionStore:
                 "conflicts": deepcopy(state["conflicts"]),
                 "tombstones": list(state["tombstones"]),
             }
+
+    # -- review comments ------------------------------------------------
+
+    def register_comments(
+        self,
+        session_id: str,
+        items: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        """Register review comments on JSON Pointer locations atomically.
+
+        Each item is a ``(path, text)`` pair.  The pointer must be a strict
+        RFC 6901 JSON Pointer and must address an existing node of the
+        session's current merged document; that node's value is snapshotted
+        with the comment (explicit ``null`` kept; a missing location is
+        rejected with 422).  Comments are registered in the session's
+        cross-process locked section, so they always observe the latest
+        committed revision.
+
+        Registering comments adds no operation, no revision and no history
+        boundary; it only persists the comment list.  An archived session
+        refuses registration with 409 before any pointer is validated.
+        Records written before review comments existed simply start with
+        an empty list.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:
+                raise SessionNotFoundError(session_id)
+            if rec.archived:
+                # The seal is immutable: no comments may be added to it.
+                raise SessionArchivedError(
+                    f"session {session_id!r} is archived at revision "
+                    f"{rec.revision} and accepts no more review comments"
+                )
+            current_document = merge_logs(rec.document, rec.version, [rec.log])[
+                "document"
+            ]
+            created: list[_ReviewComment] = []
+            # Validate every item before appending anything, so a malformed
+            # request persists no partial comment list.
+            for path, text in items:
+                try:
+                    _parse_strict_pointer(path)
+                except ValueError as exc:
+                    raise ReviewCommentValidationError(
+                        f"invalid review comment JSON Pointer {path!r}: {exc}"
+                    ) from exc
+                value = _pointer_value(current_document, path)
+                if value is _MISSING:
+                    label = "the document root" if path == "" else path
+                    raise ReviewCommentValidationError(
+                        f"review comment path {label} does not exist in the "
+                        "current document"
+                    )
+                created.append(
+                    _ReviewComment(
+                        comment_id=uuid.uuid4().hex,
+                        path=path,
+                        comment=text,
+                        revision=rec.revision,
+                        value=deepcopy(value),
+                    )
+                )
+            # Registering comments is a successful access but not a commit:
+            # a legacy record's history origin is seeded in this same atomic
+            # write, without appending any boundary.
+            self._seed_history(rec)
+            rec.comments.extend(created)
+            self._persist(rec)
+            return {
+                "session_id": rec.session_id,
+                "revision": rec.revision,
+                "comments": [note.to_state() for note in created],
+            }
+
+    def resolve_comment(
+        self,
+        session_id: str,
+        comment_id: str,
+        expected_revision: int,
+        confirm_stale: bool = False,
+    ) -> dict[str, Any]:
+        """Process (resolve) one review comment with an expected revision.
+
+        ``expected_revision`` must equal the session's current revision; a
+        concurrent commit or seal makes a stale request conflict (409).
+        A comment whose location changed after registration is marked
+        stale: processing it requires ``confirm_stale`` to be true,
+        otherwise the request conflicts (409) and changes nothing.
+        Pending comments resolve directly; resolving an already-resolved
+        comment is idempotent (its stored state is returned).  Processing
+        a comment bumps no revision and appends no history.  Comments of
+        an archived session can no longer change (409).
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:
+                raise SessionNotFoundError(session_id)
+            if rec.archived:
+                # A sealed record is immutable, including its comments.
+                raise SessionArchivedError(
+                    f"session {session_id!r} is archived at revision "
+                    f"{rec.revision}; its review comments can no longer "
+                    "be changed"
+                )
+            if expected_revision != rec.revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision} but session "
+                    f"{session_id!r} is at revision {rec.revision}"
+                )
+            note = next(
+                (c for c in rec.comments if c.comment_id == comment_id), None
+            )
+            if note is None:
+                raise ReviewCommentNotFoundError(comment_id)
+            if note.resolved:
+                # Idempotent: the same processed comment is returned.
+                state = note.to_state()
+                state["session_id"] = rec.session_id
+                return state
+            if note.stale and not confirm_stale:
+                raise RevisionConflictError(
+                    f"review comment {comment_id!r} on {note.path!r} is stale "
+                    f"(marked at revision {note.stale_revision}); resubmit "
+                    "with \"confirm_stale\": true to process it anyway"
+                )
+            note.resolved = True
+            note.resolved_revision = rec.revision
+            # Same legacy-origin seeding rationale as registration; no
+            # boundary is appended.
+            self._seed_history(rec)
+            self._persist(rec)
+            state = note.to_state()
+            state["session_id"] = rec.session_id
+            return state
 
     # -- incremental revision reads -------------------------------------
 

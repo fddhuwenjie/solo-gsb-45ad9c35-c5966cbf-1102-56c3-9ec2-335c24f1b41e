@@ -28,12 +28,17 @@
   任一路径变化（含缺失与 `null` 互变、布尔与数字互变、祖先整体替换、数组
   插入/删除导致下标位移）整次返回 `422`，不写日志、修订与变更历史；
   `GET /sessions/{id}` 读取最新修订号、文档、版本向量、冲突、墓碑、封存
-  状态与受保护路径；
-  `POST /sessions/{id}/archive` 凭期望修订号把会话**封存定稿**：在现有
-  跨进程会话锁内核对修订，计算并持久保存当前文档、版本、冲突与墓碑，
-  **不递增修订号、不写日志、不追加历史边界、不产生变更事件**；封存后
-  `/batches` 与 `/replace`（含重传和零命中请求）一律返回 `409`，文档、
-  日志与历史不再变化，以当前修订重复封存幂等返回同一份冻结结果；
+  状态、受保护路径与**审阅意见**；
+  `POST /sessions/{id}/comments` 在未封存会话上对 JSON Pointer 位置登记
+  审阅意见（保存登记时该位置的值，意见随提交可能变为过时状态）；
+  `POST /sessions/{id}/comments/{cid}/resolve` 凭期望修订号逐条处理意见
+  （处理过时意见须显式确认）；
+  `POST /sessions/{id}/archive` 凭期望修订号把会话**封存定稿**——尚有
+  待处理或过时意见时返回 `409`，全部处理后才能封存；在现有跨进程会话锁内
+  核对修订，计算并持久保存当前文档、版本、冲突与墓碑，**不递增修订号、不写
+  日志、不追加历史边界、不产生变更事件**；封存后 `/batches`、`/replace`
+  （含重传和零命中请求）与意见的登记/处理一律返回 `409`，文档、日志、历史
+  与意见不再变化，以当前修订重复封存幂等返回同一份冻结结果；
   `POST /sessions/{id}/changes` 传入已读修订号和 1～100 条订阅，按
   修订顺序增量补读之后最多 20 次已提交修订各自的路由事件，返回下次读取
   游标。每次提交都从初始文档重算累计日志（不把上次结果当作新基线），每次
@@ -610,8 +615,9 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   按文档先序为该 actor 生成连续编号的 `set` 操作并按原有合并规则原子提交；
   响应 `{"session_id", "revision", "matched_paths", "operations"}`。
 - `GET /sessions/{session_id}`：读取最新修订号、文档、版本向量、冲突、
-  墓碑、`archived`（封存状态）与 `protected_paths`（该会话创建时固定的
-  受保护路径，旧会话为 `[]`）。
+  墓碑、`archived`（封存状态）、`protected_paths`（该会话创建时固定的
+  受保护路径，旧会话为 `[]`）与 `comments`（审阅意见，旧会话为 `[]`，
+  每条带 `pending`/`stale`/`resolved` 状态与登记时快照值）。
 - `POST /sessions/{session_id}/archive`：请求体仅含 `expected_revision`，
   在该会话现有的跨进程锁内重新读盘并核对修订，通过后计算当前合并结果
   （文档、版本向量、冲突、墓碑）并随封存标记**同一个原子写**落盘，返回
@@ -619,7 +625,15 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   "conflicts", "tombstones"}`。封存**不递增修订号、不写操作日志、不追加
   历史边界、不产生任何变更事件**；封存后读取与既有修订补读照常可用。
   会话不存在返回 `404`，期望修订与当前修订不一致返回 `409`（另一个进程
-  抢先提交或抢先封存都会走到这里）。
+  抢先提交或抢先封存都会走到这里）；尚有未处理审阅意见时同样返回 `409`。
+- `POST /sessions/{session_id}/comments`：对未封存会话登记 1～50 条审阅
+  意见（`{"path", "comment"}`），保存每条 Pointer 在当前文档中的值，返回
+  `comment_id` 与初始 `pending` 状态；登记不增加修订或历史。封存后 `409`，
+  路径缺失/非法 `422`，会话不存在 `404`。
+- `POST /sessions/{session_id}/comments/{comment_id}/resolve`：凭
+  `expected_revision` 处理一条意见；过时意见须 `confirm_stale: true`
+  （否则 `409`），期望修订过期 `409`，会话/意见不存在 `404`，已封存
+  `409`；处理不增加修订或历史。
 - `POST /sessions/{session_id}/changes`：传入 `after_revision`（已读修订号）
   与 1～100 条沿用 `/route-changes` 规则的订阅，按修订顺序返回该游标之后
   最多 20 次已提交修订，每条修订是该修订文档相对**前一修订**文档的路由
@@ -712,6 +726,42 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   - 封存状态随会话 JSON 文件持久化，服务重启或多个进程共享同一
     `SESSION_STORE_DIR` 时结果一致；封存不影响受保护路径规则，封存也
     不需要修订号发生变化（修订 0 的会话同样可以封存）。
+- **审阅意见（逐条处理后方可封存）**：定稿前可对**未封存**会话登记审阅
+  意见，意见锚定一条 RFC 6901 JSON Pointer：
+  - `POST /sessions/{id}/comments`：请求体为 1～50 条
+    `{"path", "comment"}`，在会话的跨进程锁内对**当前修订**的合并文档
+    逐条解析 `path` 并**保存当时的值**（显式 `null` 原样保存；路径不
+    存在、Pointer 非法返回 `422`，整批不写入任何意见）。登记返回的每条
+    意见含服务端分配的 `comment_id`、`path`、`comment`、登记时的
+    `revision`、登记时快照 `value` 与 `status`（恒为 `pending`）。
+    登记意见**不递增修订号、不写日志、不追加历史边界、不产生变更事件**；
+    已封存会话登记一律 `409`（封存检查先于路径校验）；会话不存在 `404`。
+  - **状态随提交变为过时**：随后 `/batches` 或 `/replace` 的**成功提交**
+    改变了待处理意见所指位置的值时，编辑照常提交，意见在**同一次原子写**
+    中被持久标为 `stale`（`stale_revision` 为该次修订）。比较与受保护
+    路径同一套语义——对提交后的文档重新解析该 Pointer，因此**祖先整体
+    替换**导致后代值变化、数组 `insert`/`delete` 造成**下标位移**同样
+    识别；**缺失与显式 `null` 互变、布尔与数字互变**（`true ≠ 1`，
+    `1 == 1.0`）都算变化。过时标记**持久且不可自动复原**：之后即使把值
+    改回登记时的原值，意见仍停留在 `stale`；已过时/已处理的意见不再随
+    提交评估。整批重传（无新操作）、零命中替换不递增修订，也不会标记。
+  - `GET /sessions/{id}` 的 `comments` 按登记顺序返回全部意见，每条含
+    `status`（`pending` / `stale` / `resolved`）、`stale_revision`、
+    `resolved_revision` 以及登记时快照 `value`；旧版本写出的会话（没有
+    该字段）视为**没有意见**，读取为 `[]`。
+  - `POST /sessions/{id}/comments/{cid}/resolve`：凭
+    `expected_revision` 处理（已处理）一条意见。期望修订与当前修订不
+    一致返回 `409`（另一个提交/封存抢先）；意见已 `stale` 时必须显式
+    传 `"confirm_stale": true`，否则返回 `409` 且不改动；`pending`
+    意见直接处理；重复处理已 `resolved` 的意见幂等返回其既有状态；已
+    处理意见不会因后续编辑重新打开。处理意见同样**不增加修订或变更
+    历史**；会话不存在 `404`、意见不存在 `404`、会话已封存 `409`。
+  - **封存门槛**：会话尚有 `pending` 或 `stale` 意见时
+    `POST .../archive` 返回 `409`（错误信息列出待处理/过时意见），会话
+    不发生任何变化（不封存、不迁移旧历史、不冻结结果）；全部意见
+    `resolved` 后封存照常进行。封存后意见**不得更改**——新登记与处理
+    请求都是 `409`；`GET` 仍可读到封存前的最终意见状态。意见随会话
+    JSON 文件持久化，重启或多进程共享卷后一致。
 - **持久化**：每个会话以 JSON 文件存于 `SESSION_STORE_DIR`（默认
   `./.sessions`；docker compose 中设为 `/data/sessions`，挂载命名卷
   `session-data`），历史边界随会话同文件保存，`docker compose restart`
@@ -1151,6 +1201,145 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/0000000
 # => 404
 ```
 
+### POST /sessions/{id}/comments —— 登记审阅意见、逐条处理后封存
+
+定稿前，审阅者对未封存会话的具体 JSON Pointer 位置登记意见。登记时服务端
+保存该位置**当时的值**；之后改变该值的提交照常成功，但意见会被持久标为
+过时。所有意见处理完毕前不能封存。
+
+创建会话并登记两条意见（修订号不变，仍为 0）：
+
+```bash
+SID=$(curl -s -X POST localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"document": {"title": "draft", "items": [10, 20]}, "version": {}}' \
+  | python3 -c "import sys, json; print(json.load(sys.stdin)['session_id'])")
+
+curl -s -X POST localhost:8000/sessions/$SID/comments \
+  -H 'Content-Type: application/json' \
+  -d '{"comments": [
+    {"path": "/title", "comment": "标题需要润色"},
+    {"path": "/items/0", "comment": "确认首项是 10"}
+  ]}'
+```
+
+```json
+{
+  "session_id": "...",
+  "revision": 0,
+  "comments": [
+    {"comment_id": "8A03…", "path": "/title", "comment": "标题需要润色",
+     "revision": 0, "value": "draft", "status": "pending",
+     "stale_revision": null, "resolved_revision": null},
+    {"comment_id": "91f2…", "path": "/items/0", "comment": "确认首项是 10",
+     "revision": 0, "value": 10, "status": "pending",
+     "stale_revision": null, "resolved_revision": null}
+  ]
+}
+```
+
+路径必须在**当前文档**中存在（显式 `null` 可以登记，缺失位置返回 `422`；
+非法 Pointer、空批或超过 50 条同样 `422`）：
+
+```bash
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/comments \
+  -H 'Content-Type: application/json' \
+  -d '{"comments": [{"path": "/missing", "comment": "此处不存在"}]}'
+# => {"detail":"review comment path /missing does not exist in the current document"}
+# => HTTP 422
+```
+
+一次提交改了 `/title`：编辑照常成功（修订 1），`/title` 上的意见在同一次
+原子写中变为 `stale`；没被触及的 `/items/0` 仍是 `pending`。祖先整体替换、
+数组下标位移、缺失与 `null` 互变、布尔与数字互变都会被同样识别：
+
+```bash
+curl -s -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0,
+       "operations": [{"actor":"alice","seq":1,"version":{"alice":1},
+                       "path":"/title","action":"set","value":"final"}]}'
+# => {"session_id":"...","revision":1,"accepted":1,"duplicates":0}
+
+curl -s localhost:8000/sessions/$SID
+# => {..."revision":1, "comments":[
+#       {"comment_id":"8A03…","path":"/title","status":"stale",
+#        "value":"draft","stale_revision":1,"resolved_revision":null,...},
+#       {"comment_id":"91f2…","path":"/items/0","status":"pending",...}]}
+```
+
+即使后续提交把 `/title` 改回原值 `"draft"`，过时意见也**不会自动复原**。
+
+`pending` 意见凭当前修订号直接处理；处理 `stale` 意见必须显式
+`"confirm_stale": true`，否则 `409`；期望修订过期（期间另有提交）也是
+`409`：
+
+```bash
+# 取两条意见的 comment_id
+read C1 C2 < <(curl -s localhost:8000/sessions/$SID | python3 -c "
+import sys, json
+cs = json.load(sys.stdin)['comments']
+print(cs[0]['comment_id'], cs[1]['comment_id'])")
+
+# 未确认过时 -> 409，意见不变化
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  localhost:8000/sessions/$SID/comments/$C1/resolve \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 1}'
+# => 409
+
+# 显式确认 -> 已处理
+curl -s -X POST localhost:8000/sessions/$SID/comments/$C1/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "confirm_stale": true}'
+# => {"session_id":"...","comment_id":"8A03…","path":"/title",
+#     "status":"resolved","stale_revision":1,"resolved_revision":1,...}
+
+# pending 意见直接处理
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  localhost:8000/sessions/$SID/comments/$C2/resolve \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 1}'
+# => 200
+```
+
+登记与处理意见都**不增加修订号或变更历史**（`/changes` 不会因此多出
+修订）。仍有待处理或过时意见时封存返回 `409`，会话不发生任何变化：
+
+```bash
+# 重新登记一条未处理意见后尝试封存
+curl -s -X POST localhost:8000/sessions/$SID/comments \
+  -H 'Content-Type: application/json' \
+  -d '{"comments": [{"path": "/items/1", "comment": "再看一项"}]}' >/dev/null
+
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/archive \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 1}'
+# => {"detail":"session '...' cannot be archived while it has review comments
+#     that are not resolved -- pending: <cid> (/items/1)"}
+# => HTTP 409
+```
+
+处理掉最后一条意见后，封存照常成功；封存后登记或处理意见一律 `409`，
+意见本身仍可通过 `GET /sessions/{id}` 读取且不再变化：
+
+```bash
+C3=$(curl -s localhost:8000/sessions/$SID \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['comments'][-1]['comment_id'])")
+curl -s -o /dev/null -w 'resolve: %{http_code}\n' -X POST \
+  localhost:8000/sessions/$SID/comments/$C3/resolve \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 1}'
+# => resolve: 200
+
+curl -s -o /dev/null -w 'archive: %{http_code}\n' -X POST \
+  localhost:8000/sessions/$SID/archive \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 1}'
+# => archive: 200
+
+curl -s -o /dev/null -w 'register after archive: %{http_code}\n' -X POST \
+  localhost:8000/sessions/$SID/comments \
+  -H 'Content-Type: application/json' \
+  -d '{"comments": [{"path": "/title", "comment": "封存后不能再登记"}]}'
+# => register after archive: 409
+```
+
 ### POST /sessions/{id}/changes —— 按修订号增量补读路由事件
 
 调用方分批提交后，用已读修订号作为游标补读每次实际生效的文档变更。
@@ -1322,7 +1511,8 @@ app/
   main.py      # FastAPI 路由：POST /merge、POST /apply、POST /route-changes、POST /query、POST /resolve、
                # POST /sessions、POST /sessions/{id}/batches、GET /sessions/{id}、
                # POST /sessions/{id}/replace、POST /sessions/{id}/archive、
-               # POST /sessions/{id}/changes、GET /healthz
+               # POST /sessions/{id}/changes、POST /sessions/{id}/comments、
+               # POST /sessions/{id}/comments/{cid}/resolve、GET /healthz
   models.py    # Pydantic 请求/响应模型
   engine.py    # 合并引擎：向量时钟、校验、因果排序、冲突检测、应用器
   routing.py   # 快照递归 diff、JSON Pointer 通配模式匹配、订阅分发
@@ -1331,7 +1521,9 @@ app/
   sessions.py  # 分批会话：累计日志、不可变历史边界、跨进程原子提交（文件锁内校验+重算+边界+修订）、
                # 受保护 JSON Pointer 规则（创建时持久化、持锁提交前后逐路径比对、变化即 422 不落盘）、
                # JSONPath 批量替换（锁内选词+生成连续 set 操作+同一临界区提交）、
-               # 封存定稿（锁内核修订+冻结合并结果落盘、不增修订、封存后所有写入 409）、
+               # 审阅意见（登记时快照 Pointer 值、提交随原子写持久标记 stale 且不自动复原、
+               #   凭期望修订号处理/过时须显式确认、有待处理或过时意见时封存 409、封存后不可更改）、
+               # 封存定稿（锁内核修订+冻结合并结果落盘、不增修订、封存后所有写入与意见改动 409）、
                # 增量修订补读（每次最多 20 条、游标分页）、旧会话历史起点迁移、JSON 文件持久化
 tests/
   test_api.py              # 22 个 merge/apply 端到端测试
@@ -1346,6 +1538,9 @@ tests/
                             #   缺失/null/类型差异、祖先替换与数组位移、空可见变更仍提交、重启与多进程、旧会话空规则）
   test_session_archive.py  # 19 个封存定稿端到端测试（冻结结果、封存后写入/重传/零命中 409、幂等重封、
                             #   不增修订不产生事件、重启持久化、旧会话默认未封存、多进程封存/提交竞争）
+  test_session_comments.py # 38 个审阅意见端到端测试（登记快照值、提交持久标记过时且不自动复原、
+                            #   祖先替换/数组位移/缺失与 null/布尔与数字、凭修订处理与显式确认、
+                            #   未处理意见封存 409、封存后不可改、不增修订不产生事件、重启持久化、旧会话无意见）
 conftest.py
 Dockerfile
 docker-compose.yml

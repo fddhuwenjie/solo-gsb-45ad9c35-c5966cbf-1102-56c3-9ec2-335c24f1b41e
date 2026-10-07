@@ -367,6 +367,14 @@ class SessionStateResponse(BaseModel):
             "sessions created before this feature)"
         )
     )
+    comments: list[ReviewCommentModel] = Field(
+        default_factory=list,
+        description=(
+            "registered review comments in registration order; each carries "
+            "its snapshotted value and a pending/stale/resolved status (empty "
+            "for sessions created before this feature)"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -515,3 +523,92 @@ class RevisionChangesResponse(BaseModel):
     changes: list[RevisionChanges] = Field(
         description="up to 20 revisions after the cursor, in revision order"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /sessions/{id}/comments -- review comments registered on JSON Pointers
+# ---------------------------------------------------------------------------
+
+
+class ReviewCommentItem(BaseModel):
+    """One review comment to register: an RFC 6901 pointer plus its text.
+
+    The value found at ``path`` in the session's current merged document is
+    snapshotted with the registration (an explicit JSON ``null`` included);
+    the path must address an existing node.  ``""`` addresses the document
+    root.
+    """
+
+    path: str = Field(
+        default="",
+        description=(
+            "RFC 6901 JSON Pointer of the reviewed location ('' is the root)"
+        ),
+    )
+    comment: str = Field(min_length=1, description="the review comment text")
+
+
+class ReviewCommentsCreateRequest(BaseModel):
+    """Body of POST /sessions/{id}/comments: 1..50 comments in one request."""
+
+    comments: list[ReviewCommentItem] = Field(min_length=1, max_length=50)
+
+
+class ReviewCommentModel(BaseModel):
+    """One registered review comment as returned by the session APIs.
+
+    ``revision`` is the session revision at registration; ``value`` is the
+    value the pointer resolved to then (durable snapshot, explicit ``null``
+    preserved).  ``status`` is ``"pending"`` until a commit changes the
+    location, ``"stale"`` once such a commit has marked it (the flag is
+    durable and never clears automatically, even if the value later returns),
+    and ``"resolved"`` once the comment is explicitly processed.
+    """
+
+    comment_id: str = Field(description="server-assigned identifier of the comment")
+    path: str = Field(description="JSON Pointer (RFC 6901) of the reviewed location")
+    comment: str = Field(description="the review comment text")
+    revision: int = Field(description="session revision at which the comment was registered")
+    value: Any = Field(default=None, description="value snapshotted at registration time")
+    status: Literal["pending", "stale", "resolved"]
+    stale_revision: int | None = Field(
+        default=None,
+        description="revision of the commit that marked the comment stale",
+    )
+    resolved_revision: int | None = Field(
+        default=None,
+        description="session revision at which the comment was marked resolved",
+    )
+
+
+class ReviewCommentsCreateResponse(BaseModel):
+    """Result of registering review comments (no revision is added)."""
+
+    session_id: str
+    revision: int = Field(
+        description="the session's current revision; registering adds no revision"
+    )
+    comments: list[ReviewCommentModel] = Field(
+        description="the registered comments, in request order, all initially pending"
+    )
+
+
+class ResolveReviewCommentRequest(BaseModel):
+    """Body of POST /sessions/{id}/comments/{comment_id}/resolve.
+
+    ``expected_revision`` must equal the session's current revision.
+    ``confirm_stale`` must be true to process a comment already marked
+    stale; without it such a request conflicts (409).
+    """
+
+    expected_revision: int = Field(ge=0)
+    confirm_stale: bool = Field(
+        default=False,
+        description="must be true when the comment is stale (outdated by a later commit)",
+    )
+
+
+class ResolveReviewCommentResponse(ReviewCommentModel):
+    """The processed review comment; resolving it adds no session revision."""
+
+    session_id: str

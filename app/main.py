@@ -20,6 +20,10 @@ from .models import (
     ReplaceResponse,
     ResolveRequest,
     ResolveResult,
+    ResolveReviewCommentRequest,
+    ResolveReviewCommentResponse,
+    ReviewCommentsCreateRequest,
+    ReviewCommentsCreateResponse,
     RevisionChangesRequest,
     RevisionChangesResponse,
     RouteChangesRequest,
@@ -33,17 +37,21 @@ from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
 from .sessions import (
     CursorOutOfRangeError,
+    OpenReviewCommentsError,
     ProtectedPathError,
     ProtectedPathValidationError,
     ReplaceValidationError,
+    ReviewCommentNotFoundError,
+    ReviewCommentValidationError,
     RevisionConflictError,
+    SessionArchivedError,
     SessionNotFoundError,
     SessionStore,
 )
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -63,13 +71,19 @@ app = FastAPI(
         "may pin up to 20 immutable protected JSON Pointers at creation; "
         "any batch or JSONPath replacement whose locked commit would "
         "change one of those locations is rejected (422) without writing "
-        "a log entry, revision or history boundary.  A session may be "
-        "archived (POST /sessions/{id}/archive): the seal verifies the "
-        "expected revision inside the cross-process lock, persists the "
-        "current document/version/conflicts/tombstones without bumping "
-        "the revision, and afterwards every batch or replacement "
-        "(including retransmissions and zero-hit requests) is rejected "
-        "with 409."
+        "a log entry, revision or history boundary.  Review comments can "
+        "be registered on JSON Pointer locations "
+        "(POST /sessions/{id}/comments): the pointed-to value is "
+        "snapshotted, a commit changing that location durably marks the "
+        "comment stale (never auto-cleared), and comments are processed "
+        "with an expected revision, stale ones requiring explicit "
+        "confirmation (POST /sessions/{id}/comments/{cid}/resolve).  A "
+        "session may be archived (POST /sessions/{id}/archive) only once "
+        "every comment is resolved: the seal verifies the expected "
+        "revision inside the cross-process lock, persists the current "
+        "document/version/conflicts/tombstones without bumping the "
+        "revision, and afterwards every batch, replacement or comment "
+        "change is rejected with 409."
     ),
 )
 
@@ -289,7 +303,9 @@ def archive_session(session_id: str, req: ArchiveRequest, request: Request) -> d
         raise HTTPException(
             status_code=404, detail=f"session {session_id!r} not found"
         ) from exc
-    except RevisionConflictError as exc:
+    except (RevisionConflictError, OpenReviewCommentsError) as exc:
+        # A stale expected revision and unresolved review comments both
+        # surface as 409; the blocked seal persists nothing.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -313,3 +329,82 @@ def read_revision_changes(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RoutingValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# review comments registered on session JSON Pointers
+# ---------------------------------------------------------------------------
+
+
+def _review_not_found(session_id: str, comment_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=404,
+        detail=(
+            f"review comment {comment_id!r} not found in session "
+            f"{session_id!r}"
+        ),
+    )
+
+
+@app.post(
+    "/sessions/{session_id}/comments",
+    response_model=ReviewCommentsCreateResponse,
+)
+def register_review_comments(
+    session_id: str, req: ReviewCommentsCreateRequest, request: Request
+) -> dict:
+    """Register review comments on JSON Pointer locations of one session.
+
+    Each comment snapshots the value its pointer has at the session's
+    current revision; registering adds no revision and no change history.
+    An archived session rejects the request with 409 before validation; a
+    malformed or missing-location pointer is a 422.
+    """
+    try:
+        return _session_store(request).register_comments(
+            session_id, [(item.path, item.comment) for item in req.comments]
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except SessionArchivedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReviewCommentValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/sessions/{session_id}/comments/{comment_id}/resolve",
+    response_model=ResolveReviewCommentResponse,
+)
+def resolve_review_comment(
+    session_id: str, comment_id: str, req: ResolveReviewCommentRequest,
+    request: Request,
+) -> dict:
+    """Process one review comment with an expected revision.
+
+    A stale comment must be confirmed explicitly (``confirm_stale``); a
+    stale expected revision or an unconfirmed stale comment is a 409.
+    Processing a comment adds no revision; comments of an archived
+    session can no longer change.
+    """
+    try:
+        return _session_store(request).resolve_comment(
+            session_id,
+            comment_id,
+            req.expected_revision,
+            req.confirm_stale,
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except ReviewCommentNotFoundError:
+        # Unknown session id shape already raised SessionNotFoundError
+        # above; here the session exists but the comment does not.
+        raise _review_not_found(session_id, comment_id)
+    except RevisionConflictError as exc:
+        # Covers a stale expected revision, a session archived in the
+        # meantime and an unconfirmed stale comment.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
