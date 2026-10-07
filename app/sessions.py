@@ -86,9 +86,36 @@ conflicts.  After a successful seal every batch and JSONPath
 replacement -- including exact retransmissions and zero-hit queries,
 and before any validation -- is rejected with
 ``SessionArchivedError`` (HTTP 409) without touching the document, log
-or history.  If another process commits first, a stale seal gets the
-409; if the seal lands first, the other process's write gets the 409.
-Records written before archiving existed read the flag as false.
+or history.  Records written before archiving existed read the flag as
+false.
+
+**Review comments** (``register_comment`` / ``resolve_comment``) are
+metadata that reviewers attach to RFC 6901 JSON Pointers of an open
+session.  Registration (``POST /sessions/{id}/comments``) snapshots the
+pointer's resolved value *at that moment* in the durable record: an
+explicit JSON ``null`` is distinguished from a missing location via
+``value_present``.  Every committing batch or JSONPath replacement --
+inside the same locked section and the same atomic write as the
+revision -- flips each still-``pending`` comment to ``outdated`` when
+its pointer's resolved value on the would-be document differs from the
+snapshot, using pairwise pointer resolution with exactly the same
+semantics as the protected-pointer guard: missing-vs-present (null
+included), ancestor subtree replacement, array inserts/deletes
+shifting the pointer's index and type swaps (booleans never equal
+numbers) all count as changes.  The flip is sticky: an outdated comment
+stays outdated even when a later commit restores the registered value,
+and neither outdated nor resolved comments ever change status through a
+commit.  Comments are processed one by one
+(``POST /sessions/{id}/comments/{comment_id}/resolve``) under an
+expected-revision guard (a concurrent commit first yields 409); a
+pending comment resolves directly, while an outdated comment requires
+an explicit ``confirm_outdated`` acknowledgement.  Registering and
+resolving comments store no operation, bump no revision and append no
+history boundary (hence no change event); archiving a session that
+still has a pending or outdated comment is refused with
+``UnresolvedCommentsError`` (HTTP 409) before anything is written, and
+after a seal comments are as immutable as the rest of the record.
+Records written before comments existed read an empty list.
 
 Sessions are persisted as one JSON file per session inside a directory
 (``SESSION_STORE_DIR`` env var, default ``.sessions``), so they remain
@@ -133,6 +160,9 @@ REPLACE_MATCH_LIMIT = 20
 #: Maximum number of distinct protected JSON Pointers per session.
 PROTECTED_PATHS_LIMIT = 20
 
+#: Maximum number of review comments one session may carry.
+COMMENTS_LIMIT = 100
+
 
 class SessionNotFoundError(KeyError):
     """Raised when a session id does not exist."""
@@ -148,6 +178,29 @@ class SessionArchivedError(RevisionConflictError):
     Subclasses :class:`RevisionConflictError` so it surfaces as ``409`` at
     the HTTP layer just like a stale expected revision.
     """
+
+
+class OutdatedCommentError(RevisionConflictError):
+    """Raised when an outdated review comment is processed without explicit
+    confirmation.
+
+    Surfaces as ``409`` at the HTTP layer, alongside revision conflicts.
+    """
+
+
+class UnresolvedCommentsError(RevisionConflictError):
+    """Raised when a session with pending/outdated comments is archived.
+
+    Surfaces as ``409`` at the HTTP layer; archiving changes nothing.
+    """
+
+
+class ReviewCommentNotFoundError(KeyError):
+    """Raised when a review comment id does not exist in a session."""
+
+
+class ReviewCommentValidationError(ValueError):
+    """Raised when a review-comment request is malformed."""
 
 
 class CursorOutOfRangeError(ValueError):
@@ -341,6 +394,96 @@ class _Boundary:
 
 
 @dataclass
+class _ReviewComment:
+    """One review comment pinned to an RFC 6901 JSON Pointer.
+
+    The comment snapshots the value found at ``path`` at registration time:
+    ``value_present`` is false for a missing location (so an explicit JSON
+    ``null`` stays distinguishable from absence).  ``status`` is the only
+    mutable part: a committing batch/replacement that changes ``path``'s
+    resolved value flips ``pending`` to ``outdated`` inside the same atomic
+    write as the revision; the flip is sticky -- changing the value back to
+    the registered snapshot never restores ``pending``.  A ``resolved``
+    comment is terminal as well.
+    """
+
+    comment_id: str
+    path: str
+    comment: str
+    registered_revision: int
+    value_present: bool
+    value: Any
+    status: str = "pending"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "comment_id": self.comment_id,
+            "path": self.path,
+            "comment": self.comment,
+            "registered_revision": self.registered_revision,
+            "value_present": self.value_present,
+            "value": deepcopy(self.value),
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "_ReviewComment":
+        return cls(
+            comment_id=data["comment_id"],
+            path=data["path"],
+            comment=data["comment"],
+            registered_revision=int(data["registered_revision"]),
+            value_present=bool(data["value_present"]),
+            value=data.get("value"),
+            status=data.get("status", "pending"),
+        )
+
+    def is_outdated_against(self, document: Any) -> bool:
+        """Whether this still-pending comment's pointer changed on ``document``.
+
+        Uses the exact same pairwise resolution semantics as the
+        protected-pointer guard: a missing location and a present value
+        always differ (explicit ``null`` included), a location missing on
+        both sides is unchanged, an ancestor subtree replacement and an
+        array insert/delete shifting the pointer surface as a change, and
+        booleans never compare equal to numbers.
+        """
+        current = _pointer_value(document, self.path)
+        if not self.value_present:
+            return current is not _MISSING
+        if current is _MISSING:
+            return True
+        return not _json_equal(self.value, current)
+
+    def view(self) -> dict[str, Any]:
+        return {
+            "comment_id": self.comment_id,
+            "path": self.path,
+            "comment": self.comment,
+            "status": self.status,
+            "registered_revision": self.registered_revision,
+            "value_present": self.value_present,
+            "value": deepcopy(self.value),
+        }
+
+
+def _mark_stale_comments(comments: list[_ReviewComment], document: Any) -> bool:
+    """Persistently mark pending comments whose pointer now differs.
+
+    Returns whether at least one comment flipped to ``outdated``.  Only
+    ``pending`` comments are considered: neither ``outdated`` nor
+    ``resolved`` comments ever move again -- restoring the registered
+    value in a later commit does not un-stale an outdated comment.
+    """
+    changed = False
+    for note in comments:
+        if note.status == "pending" and note.is_outdated_against(document):
+            note.status = "outdated"
+            changed = True
+    return changed
+
+
+@dataclass
 class SessionRecord:
     """The durable state of one session.
 
@@ -361,6 +504,13 @@ class SessionRecord:
     later read.  Archiving adds neither a log entry nor a revision; once
     set, the record never changes again.  Records written before archiving
     existed read ``archived`` as false and carry no snapshot.
+
+    ``comments`` are the review comments registered against the session.
+    They live outside the document history: registering or resolving one
+    adds no operation, revision or history boundary, while a committing
+    batch/replacement may persistently flip pending comments to outdated in
+    the very same atomic write as the revision.  Records written before
+    comments existed read an empty list.
     """
 
     session_id: str
@@ -372,6 +522,7 @@ class SessionRecord:
     protected_paths: list[str] = field(default_factory=list)
     archived: bool = False
     archive_state: dict[str, Any] | None = None
+    comments: list[_ReviewComment] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -400,6 +551,10 @@ class SessionRecord:
                 if self.archive_state is not None
                 else {}
             ),
+            # Written explicitly (even as []) for the same cross-process
+            # agreement as protected_paths/archived; legacy records without
+            # the field simply read back as "no comments".
+            "comments": [note.to_json() for note in self.comments],
         }
 
     @classmethod
@@ -417,6 +572,13 @@ class SessionRecord:
         # Records written before archiving existed are open by default.
         archived = bool(data.get("archived", False))
         archive_state = data.get("archive", None) if archived else None
+        # Records written before review comments existed carry none.
+        raw_comments = data.get("comments", [])
+        comments = (
+            [_ReviewComment.from_json(item) for item in raw_comments]
+            if raw_comments
+            else []
+        )
         return cls(
             session_id=data["session_id"],
             revision=int(data["revision"]),
@@ -427,6 +589,7 @@ class SessionRecord:
             protected_paths=protected_paths,
             archived=archived,
             archive_state=archive_state,
+            comments=comments,
         )
 
 
@@ -613,6 +776,7 @@ class SessionStore:
                 "tombstones": list(rec.archive_state["tombstones"]),
                 "archived": True,
                 "protected_paths": list(rec.protected_paths),
+                "comments": [note.view() for note in rec.comments],
             }
         # Reads stay lock-free (the atomic temp-file-plus-rename persist
         # guarantees a coherent file); only a legacy record's first touch
@@ -629,6 +793,7 @@ class SessionStore:
             "tombstones": result["tombstones"],
             "archived": rec.archived,
             "protected_paths": list(rec.protected_paths),
+            "comments": [note.view() for note in rec.comments],
         }
 
     def _migrate_legacy(self, session_id: str) -> SessionRecord:
@@ -733,6 +898,12 @@ class SessionStore:
             # Immutable boundary: later batches never rewrite this entry,
             # even when late concurrent edits change the current merge.
             rec.history.append(_Boundary(rec.revision, new_document))
+            # Review comments are metadata, not document history: pending
+            # comments whose registered pointer now resolves to a different
+            # value go sticky-outdated in the same atomic write as the
+            # revision (no revision/history of their own).  Restoring the
+            # registered value in a later commit leaves them outdated.
+            _mark_stale_comments(rec.comments, new_document)
             self._persist(rec)
             return BatchOutcome(session_id, rec.revision, len(new_ops), duplicates)
 
@@ -855,6 +1026,9 @@ class SessionStore:
             rec.log = unique_ops
             rec.revision += 1
             rec.history.append(_Boundary(rec.revision, new_document))
+            # Same sticky outdated flip as submit_batch, in the same
+            # atomic commit as the generated set operations.
+            _mark_stale_comments(rec.comments, new_document)
             self._persist(rec)
             return ReplaceOutcome(
                 session_id,
@@ -900,6 +1074,25 @@ class SessionStore:
                     f"expected revision {expected_revision} but session "
                     f"{session_id!r} is at revision {rec.revision}"
                 )
+            # Every review comment must be dealt with before the session
+            # can be finalized: pending ones still await processing and
+            # outdated ones require an explicit (confirmed) resolution.
+            # The check runs against the record freshly re-read above and
+            # mutates nothing -- a refused seal writes no flag and, for a
+            # legacy record, seeds no history origin either.
+            unresolved = [
+                note for note in rec.comments if note.status in ("pending", "outdated")
+            ]
+            if unresolved:
+                pending = sum(1 for note in unresolved if note.status == "pending")
+                outdated = sum(
+                    1 for note in unresolved if note.status == "outdated"
+                )
+                raise UnresolvedCommentsError(
+                    f"cannot archive session {session_id!r}: {pending} pending "
+                    f"and {outdated} outdated review comment(s) must be "
+                    "resolved first"
+                )
             if rec.archived:
                 if rec.archive_state is None:
                     # Defensive: a record carrying the flag without its
@@ -923,6 +1116,136 @@ class SessionStore:
                 "version": dict(state["version"]),
                 "conflicts": deepcopy(state["conflicts"]),
                 "tombstones": list(state["tombstones"]),
+            }
+
+    # -- review comments -------------------------------------------------
+
+    def register_comment(
+        self,
+        session_id: str,
+        path: str,
+        comment: str,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Register a review comment on a JSON Pointer of a live session.
+
+        The comment snapshots the value the pointer resolves to on the
+        *current* merged document at registration time (an explicit
+        ``null`` stays distinguishable from a missing location).  The
+        snapshot is metadata: it stores no operation, bumps no revision,
+        appends no history boundary and produces no change event.  An
+        optional ``expected_revision`` works exactly like the edit
+        endpoints' optimistic guard.  Registration on an archived session
+        is refused with :class:`SessionArchivedError`; after sealing,
+        comments (like the rest of the record) are immutable.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        try:
+            _parse_strict_pointer(path)
+        except ValueError as exc:
+            raise ReviewCommentValidationError(
+                f"invalid review-comment JSON Pointer {path!r}: {exc}"
+            ) from exc
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:
+                raise SessionNotFoundError(session_id)
+            if rec.archived:
+                raise SessionArchivedError(
+                    f"session {session_id!r} is archived at revision "
+                    f"{rec.revision} and accepts no more review comments"
+                )
+            if expected_revision is not None and expected_revision != rec.revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision} but session "
+                    f"{session_id!r} is at revision {rec.revision}"
+                )
+            if len(rec.comments) >= COMMENTS_LIMIT:
+                raise ReviewCommentValidationError(
+                    f"at most {COMMENTS_LIMIT} review comments are allowed "
+                    f"per session (session {session_id!r} already carries "
+                    f"{len(rec.comments)})"
+                )
+            # Resolve against the ordinary current merge result; comments
+            # never migrate or alter history, so the document is read only.
+            document = self._merged_document(rec)
+            value = _pointer_value(document, path)
+            note = _ReviewComment(
+                comment_id=uuid.uuid4().hex,
+                path=path,
+                comment=comment,
+                registered_revision=rec.revision,
+                value_present=value is not _MISSING,
+                value=None if value is _MISSING else deepcopy(value),
+            )
+            rec.comments.append(note)
+            self._persist(rec)
+            return {
+                "session_id": rec.session_id,
+                "revision": rec.revision,
+                "comment": note.view(),
+            }
+
+    def resolve_comment(
+        self,
+        session_id: str,
+        comment_id: str,
+        expected_revision: int,
+        confirm_outdated: bool = False,
+    ) -> dict[str, Any]:
+        """Mark one review comment processed.
+
+        The expected revision is checked inside the session's cross-process
+        lock, so a commit landing first turns the call into a ``409`` and
+        the comment is left untouched.  A ``pending`` comment resolves
+        directly; an ``outdated`` comment additionally requires
+        ``confirm_outdated`` -- the reviewer must explicitly acknowledge
+        that the reviewed value changed after registration.  Re-processing
+        an already-resolved comment at the current revision is an idempotent
+        success.  Resolving bumps no revision and appends no history
+        boundary; comments of an archived session can no longer change.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:
+                raise SessionNotFoundError(session_id)
+            if rec.archived:
+                raise SessionArchivedError(
+                    f"session {session_id!r} is archived at revision "
+                    f"{rec.revision}; its review comments are frozen"
+                )
+            if expected_revision != rec.revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision} but session "
+                    f"{session_id!r} is at revision {rec.revision}"
+                )
+            note = next(
+                (
+                    item
+                    for item in rec.comments
+                    if item.comment_id == comment_id
+                ),
+                None,
+            )
+            if note is None:
+                raise ReviewCommentNotFoundError(comment_id)
+            if note.status == "outdated" and not confirm_outdated:
+                raise OutdatedCommentError(
+                    f"review comment {comment_id!r} on {note.path!r} is "
+                    "outdated: the value at that pointer changed after "
+                    "registration; reprocess with 'confirm_outdated' set "
+                    "to true"
+                )
+            if note.status != "resolved":
+                note.status = "resolved"
+                self._persist(rec)
+            return {
+                "session_id": rec.session_id,
+                "revision": rec.revision,
+                "comment": note.view(),
             }
 
     # -- incremental revision reads -------------------------------------

@@ -16,8 +16,12 @@ from .models import (
     OperationId,
     QueryRequest,
     QueryResponse,
+    RegisterCommentRequest,
+    RegisterCommentResponse,
     ReplaceRequest,
     ReplaceResponse,
+    ResolveCommentRequest,
+    ResolveCommentResponse,
     ResolveRequest,
     ResolveResult,
     RevisionChangesRequest,
@@ -33,17 +37,22 @@ from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
 from .sessions import (
     CursorOutOfRangeError,
+    OutdatedCommentError,
     ProtectedPathError,
     ProtectedPathValidationError,
     ReplaceValidationError,
+    ReviewCommentNotFoundError,
+    ReviewCommentValidationError,
     RevisionConflictError,
+    SessionArchivedError,
     SessionNotFoundError,
     SessionStore,
+    UnresolvedCommentsError,
 )
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -63,13 +72,23 @@ app = FastAPI(
         "may pin up to 20 immutable protected JSON Pointers at creation; "
         "any batch or JSONPath replacement whose locked commit would "
         "change one of those locations is rejected (422) without writing "
-        "a log entry, revision or history boundary.  A session may be "
-        "archived (POST /sessions/{id}/archive): the seal verifies the "
-        "expected revision inside the cross-process lock, persists the "
-        "current document/version/conflicts/tombstones without bumping "
-        "the revision, and afterwards every batch or replacement "
-        "(including retransmissions and zero-hit requests) is rejected "
-        "with 409."
+        "a log entry, revision or history boundary.  Review comments may "
+        "be registered on JSON Pointers of an open session "
+        "(POST /sessions/{id}/comments): the pointer's value at "
+        "registration is snapshotted, and a later batch or JSONPath "
+        "replacement that changes that value persistently marks the "
+        "comment outdated within the same atomic commit; comments are "
+        "processed one by one (POST /sessions/{id}/comments/{comment_id}/"
+        "resolve, with an explicit acknowledgement required for outdated "
+        "ones).  Neither action bumps the revision or writes history, and "
+        "archiving a session that still carries pending or outdated "
+        "comments is rejected (409).  A session may be archived "
+        "(POST /sessions/{id}/archive): the seal verifies the expected "
+        "revision inside the cross-process lock, persists the current "
+        "document/version/conflicts/tombstones without bumping the "
+        "revision, and afterwards every batch, replacement or comment "
+        "change (including retransmissions and zero-hit requests) is "
+        "rejected with 409."
     ),
 )
 
@@ -289,7 +308,84 @@ def archive_session(session_id: str, req: ArchiveRequest, request: Request) -> d
         raise HTTPException(
             status_code=404, detail=f"session {session_id!r} not found"
         ) from exc
+    except (RevisionConflictError, UnresolvedCommentsError) as exc:
+        # RevisionConflictError also covers SessionArchivedError (sealed
+        # sessions never reach a conflict here: re-sealing is idempotent);
+        # UnresolvedCommentsError refuses the seal while pending or outdated
+        # review comments remain.  Both are 409 and change nothing.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post(
+    "/sessions/{session_id}/comments",
+    response_model=RegisterCommentResponse,
+)
+def register_comment(
+    session_id: str, req: RegisterCommentRequest, request: Request
+) -> dict:
+    """Register a review comment on a JSON Pointer of an open session.
+
+    The pointer's current resolved value is snapshotted with the comment;
+    the registration adds no revision, operation or history boundary, and
+    an archived session refuses it with 409.
+    """
+    try:
+        return _session_store(request).register_comment(
+            session_id,
+            req.path,
+            req.comment,
+            req.expected_revision,
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except SessionArchivedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReviewCommentValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/sessions/{session_id}/comments/{comment_id}/resolve",
+    response_model=ResolveCommentResponse,
+)
+def resolve_comment(
+    session_id: str, comment_id: str, req: ResolveCommentRequest, request: Request
+) -> dict:
+    """Process one review comment under the expected-revision guard.
+
+    A pending comment resolves directly; an outdated comment requires
+    ``confirm_outdated: true`` (otherwise 409).  Processing adds no
+    revision or history; comments of an archived session are frozen.
+    """
+    try:
+        return _session_store(request).resolve_comment(
+            session_id,
+            comment_id,
+            req.expected_revision,
+            req.confirm_outdated,
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except ReviewCommentNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"review comment {str(exc)!r} not found in session "
+                f"{session_id!r}"
+            ),
+        ) from exc
+    except (
+        SessionArchivedError,
+        RevisionConflictError,
+        OutdatedCommentError,
+        UnresolvedCommentsError,
+    ) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 

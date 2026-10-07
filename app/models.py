@@ -367,6 +367,119 @@ class SessionStateResponse(BaseModel):
             "sessions created before this feature)"
         )
     )
+    comments: list["CommentView"] = Field(
+        default_factory=list,
+        description=(
+            "review comments registered against the session, each with its "
+            "current status: 'pending', 'outdated' (a committed batch or "
+            "JSONPath replacement changed the registered pointer's value "
+            "after registration; sticky) or 'resolved' (empty for sessions "
+            "created before this feature)"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /sessions/{id}/comments -- review comments pinned to JSON Pointers
+# ---------------------------------------------------------------------------
+
+
+#: The lifecycle status of a review comment.
+CommentStatus = Literal["pending", "outdated", "resolved"]
+
+
+class RegisterCommentRequest(BaseModel):
+    """Body of POST /sessions/{id}/comments: one review comment on a pointer.
+
+    ``path`` is an RFC 6901 JSON Pointer into the *current* merged document
+    (``""`` is the document root).  The value found there at registration is
+    snapshotted with the comment; an explicit JSON ``null`` is distinguished
+    from a missing location.  Registering a comment bumps no revision and
+    appends no history boundary.  ``expected_revision`` is an optional
+    optimistic-concurrency guard, exactly as for ``/batches``.
+    """
+
+    expected_revision: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "optional: when given, it must equal the session's current "
+            "revision or the request conflicts with 409"
+        ),
+    )
+    path: str = Field(
+        min_length=0,
+        description="RFC 6901 JSON Pointer of the reviewed location ('' is root)",
+    )
+    comment: str = Field(
+        min_length=1,
+        max_length=10000,
+        description="the review note attached to the pointer",
+    )
+
+
+class CommentView(BaseModel):
+    """One stored review comment and its current lifecycle status.
+
+    ``value`` is a deep copy of the value found at ``path`` at registration
+    time; ``value_present`` distinguishes an explicit JSON ``null`` from a
+    location that was missing then.  ``registered_revision`` is the session
+    revision the comment was registered at (registration itself never bumps
+    the revision).  An ``outdated`` comment never becomes ``pending`` again,
+    even when the pointer is later changed back to the registered value.
+    """
+
+    comment_id: str
+    path: str = Field(description="RFC 6901 JSON Pointer of the reviewed node")
+    comment: str
+    status: CommentStatus
+    registered_revision: int
+    value_present: bool = Field(
+        description="whether the pointer resolved to a node at registration"
+    )
+    value: Any = Field(
+        default=None,
+        description=(
+            "the value snapshotted at registration; null when the location "
+            "was missing (see value_present) or held an explicit null"
+        ),
+    )
+
+
+class RegisterCommentResponse(BaseModel):
+    session_id: str
+    revision: int = Field(
+        description="the session's current revision; registering adds no revision"
+    )
+    comment: CommentView
+
+
+class ResolveCommentRequest(BaseModel):
+    """Body of POST /sessions/{id}/comments/{comment_id}/resolve.
+
+    ``expected_revision`` must equal the session's current revision (the
+    same optimistic-concurrency guard as the edit endpoints).  A comment
+    that was marked ``outdated`` after registration can only be processed
+    with an explicit ``confirm_outdated: true``; resolving a comment never
+    bumps the revision and appends no history boundary.
+    """
+
+    expected_revision: int = Field(ge=0)
+    confirm_outdated: bool = Field(
+        default=False,
+        description=(
+            "required to be true when the comment is outdated; resolving a "
+            "pending comment succeeds without it"
+        ),
+    )
+
+
+class ResolveCommentResponse(BaseModel):
+    session_id: str
+    revision: int = Field(
+        description="the session's current revision; resolving adds no revision"
+    )
+    comment: CommentView
 
 
 # ---------------------------------------------------------------------------
